@@ -974,6 +974,11 @@ defmodule ExICE.Priv.ICEAgent do
             cand = %{cand | client: client}
             ice_agent = put_in(ice_agent.local_cands[cand.base.id], cand)
             close_candidate(ice_agent, cand)
+
+          {:permission_expired, _ip, client} ->
+            Logger.debug("TURN permission expired for relay candidate")
+            cand = %{cand | client: client}
+            put_in(ice_agent.local_cands[cand.base.id], cand)
         end
     end
   end
