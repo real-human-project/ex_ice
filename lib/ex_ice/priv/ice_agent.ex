@@ -953,32 +953,39 @@ defmodule ExICE.Priv.ICEAgent do
         end
 
       {nil, cand} ->
-        case ExTURN.Client.handle_message(cand.client, msg) do
-          {:ok, client} ->
-            cand = %{cand | client: client}
-            put_in(ice_agent.local_cands[cand.base.id], cand)
+        try do
+          case ExTURN.Client.handle_message(cand.client, msg) do
+            {:ok, client} ->
+              cand = %{cand | client: client}
+              put_in(ice_agent.local_cands[cand.base.id], cand)
 
-          {:send, dst, data, client} ->
-            cand = %{cand | client: client}
-            ice_agent = put_in(ice_agent.local_cands[cand.base.id], cand)
-            # we can't use do_send here as it will try to create permission for the turn address
-            :ok = ice_agent.transport_module.send(cand.base.socket, dst, data)
-            ice_agent
+            {:send, dst, data, client} ->
+              cand = %{cand | client: client}
+              ice_agent = put_in(ice_agent.local_cands[cand.base.id], cand)
+              # we can't use do_send here as it will try to create permission for the turn address
+              :ok = ice_agent.transport_module.send(cand.base.socket, dst, data)
+              ice_agent
 
-          {:error, _reason, client} ->
-            Logger.debug("""
-            Couldn't handle TURN message on candidate: #{inspect(cand)}. \
-            Closing candidate.\
-            """)
+            {:error, _reason, client} ->
+              Logger.debug("""
+              Couldn't handle TURN message on candidate: #{inspect(cand)}. \
+              Closing candidate.\
+              """)
 
-            cand = %{cand | client: client}
+              cand = %{cand | client: client}
+              ice_agent = put_in(ice_agent.local_cands[cand.base.id], cand)
+              close_candidate(ice_agent, cand)
+
+            {:permission_expired, _ip, client} ->
+              Logger.debug("TURN permission expired for relay candidate")
+              cand = %{cand | client: client}
+              put_in(ice_agent.local_cands[cand.base.id], cand)
+          end
+        rescue
+          e in KeyError ->
+            Logger.debug("TURN channel no longer exists (#{inspect(e.key)}), closing candidate")
             ice_agent = put_in(ice_agent.local_cands[cand.base.id], cand)
             close_candidate(ice_agent, cand)
-
-          {:permission_expired, _ip, client} ->
-            Logger.debug("TURN permission expired for relay candidate")
-            cand = %{cand | client: client}
-            put_in(ice_agent.local_cands[cand.base.id], cand)
         end
     end
   end
