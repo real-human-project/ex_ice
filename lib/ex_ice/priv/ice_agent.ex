@@ -2340,8 +2340,32 @@ defmodule ExICE.Priv.ICEAgent do
 
   defp do_close_candidate(ice_agent, %{base: %{closed?: true}}), do: ice_agent
 
+  # Special handling for relay candidates - deallocate the TURN allocation
+  defp do_close_candidate(ice_agent, %ExICE.Priv.Candidate.Relay{} = local_cand) do
+    Logger.debug("Closing relay candidate: #{local_cand.base.id}, deallocating TURN allocation")
+
+    ice_agent =
+      case ExTURN.Client.deallocate(local_cand.client) do
+        {:send, dst, data, client} ->
+          local_cand = %{local_cand | client: client}
+          ice_agent = put_in(ice_agent.local_cands[local_cand.base.id], local_cand)
+          :ok = ice_agent.transport_module.send(local_cand.base.socket, dst, data)
+          ice_agent
+
+        {:ok, _client} ->
+          # Already deallocated or in invalid state
+          ice_agent
+      end
+
+    do_close_candidate_common(ice_agent, local_cand)
+  end
+
   defp do_close_candidate(ice_agent, local_cand) do
     Logger.debug("Closing candidate: #{local_cand.base.id}")
+    do_close_candidate_common(ice_agent, local_cand)
+  end
+
+  defp do_close_candidate_common(ice_agent, local_cand) do
     ice_agent = put_in(ice_agent.local_cands[local_cand.base.id].base.closed?, true)
 
     # clear selected pair if needed
