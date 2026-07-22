@@ -6,10 +6,10 @@ jobs:
     name: lint OTP ${{matrix.otp}} / Elixir ${{matrix.elixir}}
     strategy:
       matrix:
-        otp: ['26']
-        elixir: ['1.15']
+        otp: ['27.3.1']
+        elixir: ['1.18.3']
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{matrix.otp}}
@@ -24,13 +24,13 @@ jobs:
     name: test OTP ${{matrix.otp}} / Elixir ${{matrix.elixir}}
     strategy:
       matrix:
-        otp: ['26']
-        elixir: ['1.15']
+        otp: ['27.3.1']
+        elixir: ['1.18.3']
     env:
       MIX_ENV: test
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{matrix.otp}}
@@ -40,3 +40,29 @@ jobs:
       - uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  test-relay:
+    runs-on: ubuntu-latest
+    name: test relay OTP ${{matrix.otp}} / Elixir ${{matrix.elixir}}
+    strategy:
+      matrix:
+        otp: ['27.3.1']
+        elixir: ['1.18.3']
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{matrix.otp}}
+          elixir-version: ${{matrix.elixir}}
+      - name: Start coturn
+        # the :relay test in test/integration/p2p_test.exs expects a TURN
+        # server at turn:127.0.0.1:3478?transport=udp with these credentials
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends coturn
+          sudo systemctl stop coturn || true
+          turnserver --daemon --no-cli --log-file=stdout -a -u testusername:testpassword
+      - run: mix deps.get
+      - run: mix test --include relay

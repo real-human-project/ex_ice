@@ -927,6 +927,7 @@ defmodule ExICE.Priv.ICEAgent do
     ice_agent
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def handle_ex_turn_msg(ice_agent, client_ref, msg) do
     tr_id_tr = find_gathering_transaction(ice_agent.gathering_transactions, client_ref)
 
