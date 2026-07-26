@@ -56,6 +56,18 @@ jobs:
         with:
           otp-version: ${{matrix.otp}}
           elixir-version: ${{matrix.elixir}}
+      - name: Make the runner single-homed
+        # ubuntu-latest carries docker0 (172.17.0.1) alongside eth0. ExICE
+        # binds every non-loopback address it finds, and a datagram sent from
+        # the docker0 socket to an eth0 destination is delivered with the eth0
+        # source address, so the peer's conn-check response fails ExICE's
+        # symmetry test ("non-symmetric src and dst addresses") and the agent
+        # never nominates. The :relay test assumes a single-homed host, which
+        # is also what it gets on a developer machine.
+        run: |
+          sudo ip link set docker0 down || true
+          sudo ip addr flush dev docker0 || true
+          ip -4 -o addr show scope global
       - name: Start coturn
         # the :relay test in test/integration/p2p_test.exs expects a TURN
         # server at turn:127.0.0.1:3478?transport=udp with these credentials.
