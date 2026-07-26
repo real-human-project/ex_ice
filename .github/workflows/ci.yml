@@ -58,11 +58,27 @@ jobs:
           elixir-version: ${{matrix.elixir}}
       - name: Start coturn
         # the :relay test in test/integration/p2p_test.exs expects a TURN
-        # server at turn:127.0.0.1:3478?transport=udp with these credentials
+        # server at turn:127.0.0.1:3478?transport=udp with these credentials.
+        #
+        # --relay-ip is required, not cosmetic. Left to auto-discovery on a
+        # runner ("NO EXPLICIT RELAY ADDRESS(ES) ARE CONFIGURED"), coturn picks
+        # a relayed address per session out of every local interface, including
+        # loopback. ExICE keys local_preferences by socket address but looks a
+        # relay candidate up by its relayed address, and only binds sockets on
+        # non-loopback interfaces, so a loopback allocation makes the agent
+        # raise KeyError in Candidate.priority!/3 the moment a peer reports a
+        # mapped address it does not recognise. Pinning the relayed address to
+        # the interface the agent actually binds keeps XOR-RELAYED-ADDRESS and
+        # the source address the peer observes identical.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends coturn
           sudo systemctl stop coturn || true
-          turnserver --daemon --no-cli --log-file=stdout -a -u testusername:testpassword
+          relay_ip=$(ip -4 route get 1.1.1.1 |
+            awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+          test -n "$relay_ip"
+          echo "coturn relaying on $relay_ip"
+          turnserver --daemon --no-cli --log-file=stdout \
+            -a -u testusername:testpassword --relay-ip "$relay_ip"
       - run: mix deps.get
       - run: mix test --include relay
