@@ -76,6 +76,31 @@ defmodule ExICE.Priv.ICEAgentTest do
     end
   end
 
+  defmodule SpyTransport do
+    @moduledoc false
+
+    # Delegates to Transport.Mock but additionally forwards every sent packet
+    # to the calling process, so packets stay observable after the socket
+    # (and its ets entry) has been closed.
+
+    @behaviour ExICE.Priv.Transport
+
+    @impl true
+    defdelegate open(port, opts), to: Transport.Mock
+
+    @impl true
+    defdelegate sockname(socket), to: Transport.Mock
+
+    @impl true
+    defdelegate close(socket), to: Transport.Mock
+
+    @impl true
+    def send(socket, dst, packet) do
+      Kernel.send(self(), {:spy_packet, socket, dst, packet})
+      Transport.Mock.send(socket, dst, packet)
+    end
+  end
+
   @remote_cand ExICE.Candidate.new(:host, address: {192, 168, 0, 2}, port: 8445, priority: 123)
   @remote_cand2 ExICE.Candidate.new(:host, address: {192, 168, 0, 3}, port: 8445, priority: 122)
 
@@ -2905,6 +2930,90 @@ defmodule ExICE.Priv.ICEAgentTest do
     assert <<_channel_number::16, _len::16, "somedata">> = packet
   end
 
+  test "permission expired keeps relay candidate open with updated client" do
+    remote_cand_ip = @remote_cand.address
+    {ice_agent, socket, relay_cand} = gather_relay_candidate()
+
+    # kick off a conn check so the client creates a permission
+    # for the remote candidate
+    ice_agent = ICEAgent.handle_ta_timeout(ice_agent)
+    assert packet = Transport.Mock.recv(socket)
+    assert {:ok, req} = ExSTUN.Message.decode(packet)
+    assert req.type.class == :request
+    assert req.type.method == :create_permission
+
+    resp =
+      Message.new(
+        req.transaction_id,
+        %Type{class: :success_response, method: :create_permission},
+        []
+      )
+      |> Message.with_integrity(Message.lt_key(@turn_username, @turn_password, @turn_realm))
+      |> Message.encode()
+
+    ice_agent = ICEAgent.handle_udp(ice_agent, socket, @turn_ip, @turn_port, resp)
+
+    relay_cand = Map.fetch!(ice_agent.local_cands, relay_cand.base.id)
+    assert ExTURN.Client.has_permission?(relay_cand.client, remote_cand_ip)
+
+    # simulate ex_turn notifying that the permission expired
+    ice_agent =
+      ICEAgent.handle_ex_turn_msg(
+        ice_agent,
+        relay_cand.client.ref,
+        {:permission_expired, remote_cand_ip}
+      )
+
+    # the candidate must stay open, storing the updated client
+    # (i.e. the one without the expired permission)
+    relay_cand = Map.fetch!(ice_agent.local_cands, relay_cand.base.id)
+    refute relay_cand.base.closed?
+    refute ExTURN.Client.has_permission?(relay_cand.client, remote_cand_ip)
+    assert ice_agent.state != :failed
+  end
+
+  test "stale channel refresh closes relay candidate instead of crashing the agent" do
+    {ice_agent, _socket, relay_cand} = gather_relay_candidate()
+
+    # ex_turn schedules {:refresh_channel, addr} timers; once a channel
+    # has expired and was removed from the addr_channel map, handling
+    # such a refresh raises KeyError
+    stale_addr = {@remote_cand.address, @remote_cand.port}
+
+    ice_agent =
+      ICEAgent.handle_ex_turn_msg(
+        ice_agent,
+        relay_cand.client.ref,
+        {:refresh_channel, stale_addr}
+      )
+
+    # the agent must survive and close the affected candidate
+    relay_cand = Map.fetch!(ice_agent.local_cands, relay_cand.base.id)
+    assert relay_cand.base.closed?
+  end
+
+  test "close/1 deallocates the TURN allocation of a relay candidate" do
+    {ice_agent, socket, relay_cand} = gather_relay_candidate(transport_module: SpyTransport)
+
+    # drop spy notifications for packets sent during gathering
+    flush_spy_packets()
+
+    ice_agent = ICEAgent.close(ice_agent)
+
+    # a deallocation request (refresh with lifetime 0) must have been
+    # sent to the TURN server before the socket was closed
+    assert_received {:spy_packet, ^socket, {@turn_ip, @turn_port}, packet}
+    assert {:ok, req} = ExSTUN.Message.decode(packet)
+    assert req.type.class == :request
+    assert req.type.method == :refresh
+    assert {:ok, %Lifetime{value: 0}} = Message.get_attribute(req, Lifetime)
+    refute_received {:spy_packet, _socket, _dst, _packet}
+
+    # and the common close path still runs
+    assert ice_agent.state == :closed
+    assert %{base: %{closed?: true}} = Map.fetch!(ice_agent.local_cands, relay_cand.base.id)
+  end
+
   defp connect(ice_agent) do
     [socket] = ice_agent.sockets
     [remote_cand] = Map.values(ice_agent.remote_cands)
@@ -2998,5 +3107,54 @@ defmodule ExICE.Priv.ICEAgentTest do
     assert req.type.class == :request
     assert req.type.method == :allocate
     req
+  end
+
+  defp gather_relay_candidate(opts \\ []) do
+    transport_module = Keyword.get(opts, :transport_module, Transport.Mock)
+
+    ice_agent =
+      ICEAgent.new(
+        controlling_process: self(),
+        role: :controlling,
+        if_discovery_module: IfDiscovery.MockSingle,
+        transport_module: transport_module,
+        ice_servers: [
+          %{
+            urls: "turn:#{@turn_ip_str}:#{@turn_port}?transport=udp",
+            username: @turn_username,
+            credential: @turn_password
+          }
+        ],
+        ice_transport_policy: :relay
+      )
+      |> ICEAgent.set_remote_credentials("someufrag", "somepwd")
+      |> ICEAgent.gather_candidates()
+      |> ICEAgent.add_remote_candidate(@remote_cand)
+
+    [socket] = ice_agent.sockets
+
+    ice_agent = ICEAgent.handle_ta_timeout(ice_agent)
+    req = read_allocate_request(socket)
+    resp = allocate_error_response(req.transaction_id)
+    ice_agent = ICEAgent.handle_udp(ice_agent, socket, @turn_ip, @turn_port, resp)
+    req = read_allocate_request(socket)
+    resp = allocate_success_response(req.transaction_id, ice_agent.transport_module, socket)
+    ice_agent = ICEAgent.handle_udp(ice_agent, socket, @turn_ip, @turn_port, resp)
+
+    assert %ExICE.Priv.Candidate.Relay{} =
+             relay_cand =
+             ice_agent.local_cands
+             |> Map.values()
+             |> Enum.find(&(&1.base.type == :relay))
+
+    {ice_agent, socket, relay_cand}
+  end
+
+  defp flush_spy_packets() do
+    receive do
+      {:spy_packet, _socket, _dst, _packet} -> flush_spy_packets()
+    after
+      0 -> :ok
+    end
   end
 end
